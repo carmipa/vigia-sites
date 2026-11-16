@@ -1,0 +1,74 @@
+# VIGIA DIÁRIO — os três sites medidos de fora, uma vez por dia, sem nada rodando nos servidores.
+#
+# Entre um deploy e outro, um certificado vencendo, uma página caindo ou o 404 virando 200 passavam dias sem ninguém
+# ver. Aqui o GitHub pede cada site como um visitante pediria; quando algo falha, o próprio GitHub manda e-mail para a
+# conta dona do repositório.
+#
+# Por site, confere:
+#   1. cada página do sitemap.xml responde 200, e há pelo menos 5 (sitemap vazio também reprova);
+#   2. o robots.txt responde e aponta o sitemap; um endereço que não existe responde 404 de verdade;
+#   3. o certificado do domínio e do www com mais de 20 dias.
+#
+# Não usa segredo nenhum e não escreve nada. O agente não manda idioma, então a telemetria dos sites o conta como
+# robô, não como visita.
+#
+# Atenção: o GitHub desliga o agendamento de repositório sem commit há 60 dias, e avisa por e-mail antes.
+name: vigia
+
+on:
+  schedule:
+    - cron: "17 11 * * *"   # 08:17 de São Paulo
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  site-de-fora:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        site: [carminati.dev.br, carminati.fst.br, finocchio.fst.br]
+    steps:
+      - name: Páginas do sitemap, robots.txt e 404
+        env:
+          SITE: ${{ matrix.site }}
+        run: |
+          set -u
+          UA="Mozilla/5.0 (compatible; vigia-do-site; +https://github.com/carmipa/vigia-sites)"
+          BASE="https://$SITE"
+          falhou=0
+          paginas=$(curl -sS --max-time 20 -A "$UA" "$BASE/sitemap.xml" | grep -o '<loc>[^<]*</loc>' | sed 's/<[^>]*>//g' || true)
+          n=$(printf '%s\n' "$paginas" | grep -c '^https://' || true)
+          if [ "$n" -lt 5 ]; then echo "::error::$SITE: sitemap com $n página(s) — esperado 5 ou mais"; falhou=1; fi
+          for u in $paginas; do
+            s=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -A "$UA" "$u" || true); s=${s:-000}
+            if [ "$s" != "200" ]; then echo "::error::$u respondeu $s"; falhou=1; else echo "$u 200"; fi
+          done
+          robots=$(curl -sS --max-time 20 -A "$UA" "$BASE/robots.txt" || true)
+          if ! printf '%s' "$robots" | grep -qi '^sitemap:'; then echo "::error::$SITE: robots.txt sem a linha Sitemap"; falhou=1; fi
+          s=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -A "$UA" "$BASE/vigia-pagina-que-nao-existe" || true); s=${s:-000}
+          if [ "$s" != "404" ]; then echo "::error::$SITE: endereço inexistente respondeu $s (esperado 404)"; falhou=1; else echo "404 de verdade"; fi
+          exit $falhou
+
+      - name: Certificado com mais de 20 dias
+        env:
+          SITE: ${{ matrix.site }}
+        run: |
+          falhou=0
+          for host in "$SITE" "www.$SITE"; do
+            fim=$(echo | timeout 20 openssl s_client -servername "$host" -connect "$host:443" 2>/dev/null \
+                  | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+            if [ -z "$fim" ]; then
+              echo "::error::$host: não deu para ler o certificado"; falhou=1; continue
+            fi
+            dias=$(( ( $(date -d "$fim" +%s) - $(date +%s) ) / 86400 ))
+            if [ "$dias" -lt 20 ]; then
+              echo "::error::$host: o certificado vence em $dias dia(s) ($fim)"; falhou=1
+            else
+              echo "$host: certificado válido por mais $dias dias"
+            fi
+          done
+          exit $falhou
